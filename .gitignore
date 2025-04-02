@@ -509,6 +509,7 @@ out/
 *.ncrunchsolution
 *.cache/
 *.sln.iml
+*.sln
 
 # Build artifacts
 artifacts/
