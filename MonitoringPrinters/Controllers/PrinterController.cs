@@ -17,24 +17,9 @@ namespace MonitoringPrinters.Controllers
         }
 
         [HttpGet("{ipAddress}")]
-        public async Task<ActionResult<PrinterInfo>> GetPrinterMetrics(string ipAddress, string community = null)
+        public async Task<ActionResult<PrinterInfo>> GetPrinterMetrics(string ipAddress)
         {
-            if (string.IsNullOrEmpty(community))
-            {
-
-                var printers = _printerService.GetAllPrinters();
-                var printer = printers.FirstOrDefault(p => p.Ip == ipAddress);
-                if (printer != null)
-                {
-                    community = printer.Community;
-                }
-                else
-                {
-                    community = "public";
-                }
-            }
-
-            var printerInfo = await _printerService.GetPrinterInfoAsync(ipAddress, community);
+            var printerInfo = await _printerService.GetPrinterInfoAsync(ipAddress);
             return Ok(printerInfo);
         }
 
