@@ -72,8 +72,12 @@ namespace MonitoringPrinters.Service
                  }
             }
         };
+        // Статический словарь для хранения работающих версий SNMP по IP-адресам
+        private static Dictionary<string, VersionCode> snmpVersionCache = new Dictionary<string, VersionCode>();
+
         public object GetSnmpData(string ipAddress, string oid, string community = "public")
         {
+            Console.WriteLine($"{DateTime.Now}: Starting SNMP request to {ipAddress} for OID {oid}");
             try
             {
                 var endpoint = new IPEndPoint(IPAddress.Parse(ipAddress), 161);
@@ -82,7 +86,26 @@ namespace MonitoringPrinters.Service
                 var variables = new List<Variable> { new Variable(oidToQuery) };
                 const int timeout = 10000;
 
-            
+                // Проверяем, известна ли уже рабочая версия для этого IP
+                if (snmpVersionCache.TryGetValue(ipAddress, out VersionCode knownVersion))
+                {
+                    Console.WriteLine($"{DateTime.Now}: Using cached SNMP version {knownVersion} for {ipAddress}");
+                    var result = Messenger.Get(knownVersion,
+                                          endpoint,
+                                          communityString,
+                                          variables,
+                                          timeout);
+                    if (result != null && result.Count > 0)
+                    {
+                        var data = result[0].Data;
+                        Console.WriteLine($"{DateTime.Now}: SNMP data retrieved: {data?.ToString() ?? "null"}");
+                        return data;
+                    }
+                    // Если кэшированная версия перестала работать, удаляем из кэша
+                    snmpVersionCache.Remove(ipAddress);
+                }
+
+                // Если нет кэшированной версии или она перестала работать, пробуем SNMPv2
                 try
                 {
                     var resultV2 = Messenger.Get(VersionCode.V2,
@@ -93,14 +116,18 @@ namespace MonitoringPrinters.Service
                     if (resultV2 != null && resultV2.Count > 0)
                     {
                         Console.WriteLine($"{DateTime.Now}: Successfully connected to {ipAddress} using SNMPv2");
-                        return resultV2[0].Data;
+                        // Сохраняем в кэш
+                        snmpVersionCache[ipAddress] = VersionCode.V2;
+                        var data = resultV2[0].Data;
+                        Console.WriteLine($"{DateTime.Now}: SNMPv2 data retrieved: {data?.ToString() ?? "null"}");
+                        return data;
                     }
                 }
                 catch (Exception ex)
                 {
                     Console.WriteLine($"{DateTime.Now}: SNMPv2 failed for {ipAddress}: {ex.Message}. Trying SNMPv1...");
 
-                    
+                    // Пробуем SNMPv1
                     var resultV1 = Messenger.Get(VersionCode.V1,
                                               endpoint,
                                               communityString,
@@ -109,11 +136,14 @@ namespace MonitoringPrinters.Service
                     if (resultV1 != null && resultV1.Count > 0)
                     {
                         Console.WriteLine($"{DateTime.Now}: Successfully connected to {ipAddress} using SNMPv1");
-                        return resultV1[0].Data;
+                        // Сохраняем в кэш
+                        snmpVersionCache[ipAddress] = VersionCode.V1;
+                        var data = resultV1[0].Data;
+                        Console.WriteLine($"{DateTime.Now}: SNMPv1 data retrieved: {data?.ToString() ?? "null"}");
+                        return data;
                     }
                 }
 
-                
                 Console.WriteLine($"{DateTime.Now}: No SNMP response from {ipAddress} for OID {oid}");
                 return null;
             }
