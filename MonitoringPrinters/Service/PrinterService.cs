@@ -80,18 +80,20 @@ namespace MonitoringPrinters.Service
 
         public object GetSnmpData(string ipAddress, string oid, string community = "public")
         {
-            Console.WriteLine($"{DateTime.Now}: Starting SNMP request to {ipAddress} for OID {oid}");
+            var logger = new Action<string>(message => Console.WriteLine($"{DateTime.Now}: {message}"));
+            logger($"Starting SNMP request to {ipAddress} for OID {oid}");
+
             try
             {
                 var endpoint = new IPEndPoint(IPAddress.Parse(ipAddress), 161);
-                const int timeout = 10000;
+                const int timeout = 3000; // Уменьшил таймаут до 3 секунд
                 var oidToQuery = new ObjectIdentifier(oid);
                 var variables = new List<Variable> { new Variable(oidToQuery) };
 
-                
+                // 1. Проверка кэша соединений
                 if (snmpConnectionCache.TryGetValue(ipAddress, out SnmpConnectionInfo connectionInfo))
                 {
-                    Console.WriteLine($"{DateTime.Now}: Using cached SNMP version {connectionInfo.Version} with community '{connectionInfo.Community}' for {ipAddress}");
+                    logger($"Using cached SNMP version {connectionInfo.Version} with community '{connectionInfo.Community}' for {ipAddress}");
 
                     try
                     {
@@ -104,94 +106,116 @@ namespace MonitoringPrinters.Service
                         if (result != null && result.Count > 0)
                         {
                             var data = result[0].Data;
-                            Console.WriteLine($"{DateTime.Now}: SNMP data retrieved: {data?.ToString() ?? "null"}");
+                            logger($"SNMP data retrieved: {data?.ToString() ?? "null"}");
                             return data;
                         }
                     }
                     catch (Exception ex)
                     {
-                        Console.WriteLine($"{DateTime.Now}: Cached settings failed for {ipAddress}: {ex.Message}. Will try other options.");
-                        
+                        logger($"Cached settings failed for {ipAddress}: {ex.Message}. Will try other options.");
                         snmpConnectionCache.Remove(ipAddress);
                     }
                 }
 
-             
-                List<string> communitiesToTry = new List<string>();
+                // 2. Формирование списка community для проверки без дубликатов и с приоритетом
+                HashSet<string> communitiesToTry = new HashSet<string>();
 
-               
+                // Сначала добавляем переданный community
                 if (!string.IsNullOrEmpty(community))
                 {
                     communitiesToTry.Add(community);
                 }
 
-                
+                // Затем остальные из известных
                 foreach (var comm in knownCommunities)
                 {
-                    if (comm != community && !communitiesToTry.Contains(comm))
-                    {
-                        communitiesToTry.Add(comm);
-                    }
+                    communitiesToTry.Add(comm);
                 }
 
-                
+                // 3. Параллельное тестирование комбинаций версий и community
+                var tasks = new List<Task<(bool Success, VersionCode Version, string Community, object Data)>>();
+
                 foreach (var comm in communitiesToTry)
                 {
-                    var communityString = new OctetString(comm);
+                    // Запускаем параллельную проверку для SNMPv2
+                    tasks.Add(Task.Run(() => TrySnmpGet(VersionCode.V2, endpoint, comm, variables, timeout / 2, logger)));
 
-   
-                    try
-                    {
-                        var resultV2 = Messenger.Get(VersionCode.V2,
-                                                  endpoint,
-                                                  communityString,
-                                                  variables,
-                                                  timeout);
-                        if (resultV2 != null && resultV2.Count > 0)
-                        {
-                            Console.WriteLine($"{DateTime.Now}: Successfully connected to {ipAddress} using SNMPv2 with community '{comm}'");
-                            snmpConnectionCache[ipAddress] = new SnmpConnectionInfo { Version = VersionCode.V2, Community = comm };
-                            var data = resultV2[0].Data;
-                            Console.WriteLine($"{DateTime.Now}: SNMPv2 data retrieved: {data?.ToString() ?? "null"}");
-                            return data;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine($"{DateTime.Now}: SNMPv2 with community '{comm}' failed for {ipAddress}: {ex.Message}. Trying SNMPv1...");
-
-                        try
-                        {
-                            var resultV1 = Messenger.Get(VersionCode.V1,
-                                                      endpoint,
-                                                      communityString,
-                                                      variables,
-                                                      timeout);
-                            if (resultV1 != null && resultV1.Count > 0)
-                            {
-                                Console.WriteLine($"{DateTime.Now}: Successfully connected to {ipAddress} using SNMPv1 with community '{comm}'");
-                                snmpConnectionCache[ipAddress] = new SnmpConnectionInfo { Version = VersionCode.V1, Community = comm };
-                                var data = resultV1[0].Data;
-                                Console.WriteLine($"{DateTime.Now}: SNMPv1 data retrieved: {data?.ToString() ?? "null"}");
-                                return data;
-                            }
-                        }
-                        catch (Exception exV1)
-                        {
-                            Console.WriteLine($"{DateTime.Now}: SNMPv1 with community '{comm}' also failed for {ipAddress}: {exV1.Message}");
-                       
-                        }
-                    }
+                    // Запускаем параллельную проверку для SNMPv1
+                    tasks.Add(Task.Run(() => TrySnmpGet(VersionCode.V1, endpoint, comm, variables, timeout / 2, logger)));
                 }
 
-                Console.WriteLine($"{DateTime.Now}: No SNMP response from {ipAddress} for OID {oid} with any available community settings");
+                // 4. Ожидаем первый успешный результат или завершение всех задач
+                while (tasks.Any(t => !t.IsCompleted))
+                {
+                    // Проверяем, есть ли успешно завершенные задачи
+                    var completedTask = tasks.FirstOrDefault(t => t.IsCompleted && !t.IsFaulted && t.Result.Success);
+                    if (completedTask != null)
+                    {
+                        var result = completedTask.Result;
+
+                        // Кэшируем успешное соединение
+                        logger($"Successfully connected to {ipAddress} using SNMP{result.Version} with community '{result.Community}'");
+                        snmpConnectionCache[ipAddress] = new SnmpConnectionInfo { Version = result.Version, Community = result.Community };
+
+                        // Возвращаем данные
+                        logger($"SNMP{result.Version} data retrieved: {result.Data?.ToString() ?? "null"}");
+                        return result.Data;
+                    }
+
+                    // Небольшая задержка перед следующей проверкой
+                    Thread.Sleep(50);
+                }
+
+                // Проверяем, есть ли успешные результаты среди завершенных задач
+                var successfulTask = tasks.FirstOrDefault(t => !t.IsFaulted && t.Result.Success);
+                if (successfulTask != null)
+                {
+                    var result = successfulTask.Result;
+                    logger($"Successfully connected to {ipAddress} using SNMP{result.Version} with community '{result.Community}'");
+                    snmpConnectionCache[ipAddress] = new SnmpConnectionInfo { Version = result.Version, Community = result.Community };
+                    logger($"SNMP{result.Version} data retrieved: {result.Data?.ToString() ?? "null"}");
+                    return result.Data;
+                }
+
+                logger($"No SNMP response from {ipAddress} for OID {oid} with any available community settings");
                 return null;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"{DateTime.Now}: SNMP error: {ex.Message} for OID {oid} on {ipAddress}");
+                logger($"SNMP error: {ex.Message} for OID {oid} on {ipAddress}");
                 return null;
             }
+        }
+
+        // Вспомогательный метод для попытки получения SNMP-данных с указанной версией и community
+        private (bool Success, VersionCode Version, string Community, object Data) TrySnmpGet(
+            VersionCode version,
+            IPEndPoint endpoint,
+            string community,
+            List<Variable> variables,
+            int timeout,
+            Action<string> logger)
+        {
+            try
+            {
+                var communityString = new OctetString(community);
+                var result = Messenger.Get(version,
+                                      endpoint,
+                                      communityString,
+                                      variables,
+                                      timeout);
+
+                if (result != null && result.Count > 0)
+                {
+                    return (true, version, community, result[0].Data);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger($"SNMP{version} with community '{community}' failed: {ex.Message}");
+            }
+
+            return (false, version, community, null);
         }
         public async Task<PrinterInfo> GetPrinterInfoAsync(string ipAddress, string community = "zabbix")
         {
